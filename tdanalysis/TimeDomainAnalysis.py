@@ -8,6 +8,7 @@ from os.path import isfile
 import pickle
 from pathlib import Path
 import dask
+import h5py
 
 
 class CovarianceCalculator:
@@ -88,6 +89,11 @@ class CovarianceCalculator:
             self.estimator = np.median
         else:
             raise KeyError(f"Unknown estimator {self.auto_corr_method}")
+
+        if self.backend == "numpy":
+            self.Cij_extn = "npy"
+        else:
+            self.Cij_extn = "h5"
 
     @property
     def sampling_frequency(self):
@@ -261,7 +267,7 @@ class CovarianceCalculator:
 
             self._download = False
 
-            if self.check_file_exists(self.Cij_file_name):
+            if self.check_file_exists(f"{self.Cij_file_name}.{self.Cij_extn}"):
                 message("Loading Cij from disk", message_verbosity=1)
                 self.load_Cij()
 
@@ -269,9 +275,7 @@ class CovarianceCalculator:
 
                 if self.check_file_exists(self.moments_file_name):
                     self.load_stat_moments()
-
                     self._compute_moments = False
-
                     self._nothing_todo = True
 
         else:
@@ -286,19 +290,22 @@ class CovarianceCalculator:
 
         original_sampling_f = self.entire_noise_ts.sample_rate
 
-        if int(self.sampling_frequency) != int(original_sampling_f):
+        if int(self.sampling_frequency) != int(original_sampling_f.value):
             message("Resampling using cubic spline", message_verbosity=2)
 
             from scipy.interpolate import interp1d
 
             new_dt = 1 / self.sampling_frequency
+
+            print(new_dt)
+
             new_time_axis = np.arange(
-                self.entire_noise_ts_time_axis[0],
-                self.entire_noise_ts_time_axis[-1],
+                self.entire_noise_ts_time_axis[0].value,
+                self.entire_noise_ts_time_axis[-1].value,
                 new_dt,
             )
             new_entire_noise_ts = interp1d(
-                self.entire_noise_ts_time_axis, self.entire_noise_ts, kind="Cubic"
+                self.entire_noise_ts_time_axis, self.entire_noise_ts, kind="cubic"
             )(new_time_axis)
 
             self._entire_noise_ts = TimeSeries(
@@ -420,6 +427,7 @@ class CovarianceCalculator:
 
         count = 0
         total_num_entries = N * (N + 1) / 2
+        num_unique_entries = len(auto_corr)
 
         if self.backend == "numpy":
             row_idx, col_idx = np.indices(Cij.shape)
@@ -431,7 +439,7 @@ class CovarianceCalculator:
         for rel_idx, acor_val in enumerate(auto_corr):
             Cij[abs(row_idx - col_idx) == rel_idx] = acor_val
             count += 1
-            print(f"Progress: {count/total_num_entries}%", end="\r")
+            print(f"Progress: {100*count/num_unique_entries}%", end="\r")
 
         # for row_ind in range(N):
         #    for col_ind in range(row_ind, N):
@@ -581,23 +589,21 @@ class CovarianceCalculator:
             raise FileExistsError(f"{self.Cij_file_name} File already exists!")
 
         else:
-            self.save(self.Cij_file_name, self.Cij)
+            self.save_array(self.Cij_file_name, self.Cij)
 
     def load_Cij(self):
-        if isinstance(np.ndarray, array):
+        if self.backend == "numpy":
             self._Cij = np.load(f"{self.Cij_file_name}.npy")
-        elif isinstance(self, da.array):
-
-            f = h5py.File(f"{self.Cij_file_name}.h5")["/Cij"]
-            self._Cij = dask.array.from_array(f)
-            f.close()
+        elif self.backend == "dask":
+            fd = h5py.File(f"{self.Cij_file_name}.h5")["/Cij"]
+            self._Cij = dask.array.from_array(fd)
 
     def save_array(self, file_name, array):
 
-        if isinstance(np.ndarray, array):
+        if isinstance(array, np.ndarray):
             np.save(f"{file_name}.npy", array)
 
-        elif isinstance(self, da.array):
+        elif isinstance(self, dask.array.core.Array):
             return array.to_hdf5(f"{file_name}.h5", "/Cij")
 
     def compute_stat_moments(self, noise_ts):

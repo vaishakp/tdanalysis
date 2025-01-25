@@ -13,17 +13,19 @@ from config.verbosity import levels
 vlev = levels()
 vlev.set_print_verbosity(1)
 
-
 tdal = CovarianceCalculator(
-    ref_gps_time=1420878141,
+    ref_gps_time=1420878140,
     noise_sampling_range=512,
-    correlation_duration=16,
-    n_cov=16,
-    gps_time_exclusion_duration=14,
+    correlation_duration=64,
+    n_cov=128,
+    gps_time_exclusion_duration=16,
     analysis_duration=14,
     data_type="server",
-    sampling_frequency=4096 * 4,
+    backend="dask",
+    chunks=100000,
+    sampling_frequency=4096,
 )
+
 
 tdal.initialize()
 

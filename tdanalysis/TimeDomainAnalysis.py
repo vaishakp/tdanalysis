@@ -1,13 +1,13 @@
 from os import listdir
 from sys import prefix
 import numpy as np
-from paramiko import Channel
 from gwpy.timeseries import TimeSeries
 from waveformtools.waveformtools import message, progressbar, roll
 import os
 from os.path import isfile
 import pickle
 from pathlib import Path
+import dask
 
 
 class CovarianceCalculator:
@@ -39,6 +39,8 @@ class CovarianceCalculator:
         channel="GDS-CALIB_STRAIN_CLEAN",
         analysis_duration=1,
         data_type="open",
+        backend="dask",
+        chunks=10000,
     ):
         self._sampling_frequency = sampling_frequency
         self._correlation_duration = correlation_duration
@@ -50,6 +52,8 @@ class CovarianceCalculator:
         self._detector = detector
         self.channel = channel
         self.data_type = data_type
+        self.backend = backend
+        self.chunks = chunks
 
         if self.data_type == "open":
             self.load_channel = self.detector
@@ -74,6 +78,8 @@ class CovarianceCalculator:
         self._download = True
         self._compute_moments = True
 
+        self.setup_backend()
+
         # self.initialize()
 
         if self.auto_corr_method == "mean":
@@ -90,14 +96,6 @@ class CovarianceCalculator:
     @property
     def correlation_duration(self):
         return self._correlation_duration
-
-    @property
-    def nlive(self):
-        return self._nlive
-
-    @property
-    def priors(self):
-        return self._priors
 
     @property
     def n_cov(self):
@@ -200,21 +198,50 @@ class CovarianceCalculator:
     def compute_moments(self):
         return self._compute_moments
 
+    def setup_backend(self):
+
+        if self.backend == "numpy":
+            from numpy import mean, median, sqrt, dot
+
+            self.zeros = np.zeros
+            self.array = np.array
+
+            self.mean = np.mean
+            self.median = np.median
+            self.sqrt = np.sqrt
+            self.dot = np.dot
+
+        elif self.backend == "dask":
+            from functools import partial
+            import dask.array
+
+            self.zeros = partial(dask.array.wrap.zeros, chunks=self.chunks)
+            self.array = partial(dask.array.from_array, chunks=self.chunks)
+
+            self.mean = dask.array.reductions.mean
+            self.median = dask.array.reductions.median
+            self.sqrt = dask.array.ufunc.sqrt
+            self.dot = dask.array.routines.dot
+
+        else:
+            raise KeyError(f"Unknown backend {self.backend}")
+
     def initialize(self):
 
         message("Initializing")
         message("\tParsing GPS times...")
 
+        self._Cij_file_name = f"Cij_gpsT{self.ref_gps_time}_R{self.noise_sampling_range}_D{self.correlation_duration}_S{self.sampling_frequency}_A{self.analysis_duration}_N{self.n_cov}"
+        self._moments_file_name = f"moments_gpsT{self.ref_gps_time}_R{self.noise_sampling_range}_D{self.correlation_duration}_S{self.sampling_frequency}_A{self.analysis_duration}_N{self.n_cov}.pkl"
+
         if self.data_type == "open" or self.data_type == "server":
             self.setup_online_data()
 
         else:
-            self.find_data_segment()
-            self.load_data_propreitery()
-            self._data_file_name = f"Entire_noise_ts_{self.data_type}_gpsTref{self.ref_gps_time}_{self.entire_segment_gps_start_time}_{self._entire_segment_gps_end_time}_S{self.sampling_frequency}_A{self.analysis_duration}.txt"
-
-        self._Cij_file_name = f"Cij_gpsT{self.ref_gps_time}_R{self.noise_sampling_range}_D{self.correlation_duration}_S{self.sampling_frequency}_A{self.analysis_duration}_N{self.n_cov}.npy"
-        self._moments_file_name = f"moments_gpsT{self.ref_gps_time}_R{self.noise_sampling_range}_D{self.correlation_duration}_S{self.sampling_frequency}_A{self.analysis_duration}_N{self.n_cov}.pkl"
+            # self.find_data_segment()
+            # self.load_data_propreitery()
+            # self._data_file_name = f"Entire_noise_ts_{self.data_type}_gpsTref{self.ref_gps_time}_{self.entire_segment_gps_start_time}_{self._entire_segment_gps_end_time}_S{self.sampling_frequency}_A{self.analysis_duration}.txt"
+            raise NotImplementedError
 
     def setup_online_data(self):
         """Download, and read in open data"""
@@ -229,7 +256,7 @@ class CovarianceCalculator:
 
         message("Obtaining data")
         if self.check_file_exists(self.data_file_name):
-            message("\tLoading data from disk")
+            message("\tLoading data from disk", message_verbosity=1)
             self.load_entire_time_segment()
 
             self._download = False
@@ -251,8 +278,33 @@ class CovarianceCalculator:
             message("\tDownloading data")
             self.download_full_data()
 
+            self.resample_data()
             message("\t Saving data to disk")
             self.save_entire_time_segment()
+
+    def resample_data(self):
+
+        original_sampling_f = self.entire_noise_ts.sample_rate
+
+        if int(self.sampling_frequency) != int(original_sampling_f):
+            message("Resampling using cubic spline", message_verbosity=2)
+
+            from scipy.interpolate import interp1d
+
+            new_dt = 1 / self.sampling_frequency
+            new_time_axis = np.arange(
+                self.entire_noise_ts_time_axis[0],
+                self.entire_noise_ts_time_axis[-1],
+                new_dt,
+            )
+            new_entire_noise_ts = interp1d(
+                self.entire_noise_ts_time_axis, self.entire_noise_ts, kind="Cubic"
+            )(new_time_axis)
+
+            self._entire_noise_ts = TimeSeries(
+                data=new_entire_noise_ts, times=new_time_axis
+            )
+            self.entire_noise_ts_time_axis = new_time_axis
 
     def compute_effective_noise_segment_gps_times(self):
         """Get the noise segment GPS time endpoints of correlation duration
@@ -294,8 +346,7 @@ class CovarianceCalculator:
 
     def fetch_data_array(self, segment_number):
 
-        if not (np.array(self.entire_noise_ts) == np.array(None)).all():
-
+        if self.check_array_exists(self.entire_noise_ts):
             message("Fetching saved data", message_verbosity=3)
             # print(self.get_segment_gps_times(segment_number))
             seg_gsp_start, seg_gps_end = self.get_segment_gps_times(segment_number)
@@ -305,15 +356,12 @@ class CovarianceCalculator:
             ind_end = (
                 seg_gps_end - self.entire_segment_gps_start_time
             ) * self.sampling_frequency
-
-            # print(ind_start, ind_end)
-
             noise_ts = self.entire_noise_ts[ind_start:ind_end]
 
         else:
             try:
-                noise_ts = TimeSeries.fetch_open_data(
-                    self.detector,
+                noise_ts = self.get_data(
+                    self.channel,
                     *self.get_segment_gps_times(segment_number),
                     verbose=True,
                 )
@@ -323,11 +371,20 @@ class CovarianceCalculator:
 
         return self.demean_ts(noise_ts)
 
+    def check_array_exists(self, array):
+
+        # if self.backend=='numpy':
+        return not (np.array(self.entire_noise_ts) == np.array(None)).all()
+        # elif self.backend=='dask':
+        #    return not (self.entire_noise_ts == None).all().compute()
+        # else:
+        #    raise KeyError(f"Unknown backend {self.backend}")
+
     def estimate_auto_corr(self):
         """Estimate the auto-correaltion function using all
         the noise segments"""
 
-        message("Computing autocorrelations", message_verbosity=1)
+        message("Computing autocorrelations...\n", message_verbosity=1)
 
         all_auto_corr = np.zeros((self.n_cov, self.N_analysis))
 
@@ -338,7 +395,7 @@ class CovarianceCalculator:
             self._all_moments.update({seg_ind: one_set_of_moments})
             auto_corr_i = self.auto_coorelate(noise_ts)
             all_auto_corr[seg_ind, :] = auto_corr_i
-            progressbar(seg_ind, self.n_cov)
+            progressbar(seg_ind + 1, self.n_cov)
 
         self._all_auto_corr = all_auto_corr
 
@@ -347,41 +404,50 @@ class CovarianceCalculator:
         )
 
         self._est_auto_corr = est_auto_corr
+        message("\n", message_verbosity=1)
 
     def estimate_symm_toeplez_Cij(self):
         """Construct a symmetric Toeplex cross correlation
         matrix from a given a noise time series"""
 
-        message("Computing the cross correlation matrix")
+        message("\nComputing the cross correlation matrix")
 
         auto_corr = self.est_auto_corr
 
-        # noise_array = np.array(noise_ts)
         N = self.N_analysis
 
-        # auto_corr = np.correlate(noise_array, noise_array)
-
-        Cij = np.zeros((N, N))
+        Cij = self.zeros((N, N))
 
         count = 0
         total_num_entries = N * (N + 1) / 2
 
-        for row_ind in range(N):
-            for col_ind in range(row_ind, N):
+        if self.backend == "numpy":
+            row_idx, col_idx = np.indices(Cij.shape)
+        elif self.backend == "dask":
+            row_idx, col_idx = dask.array.indices(Cij.shape)
+        else:
+            raise KeyError(f"Unknown backend {self.backend}")
 
-                rho_ind = abs(col_ind - row_ind)
+        for rel_idx, acor_val in enumerate(auto_corr):
+            Cij[abs(row_idx - col_idx) == rel_idx] = acor_val
+            count += 1
+            print(f"Progress: {count/total_num_entries}%", end="\r")
 
-                Cij[row_ind, col_ind] = auto_corr[rho_ind]
+        # for row_ind in range(N):
+        #    for col_ind in range(row_ind, N):
 
-                if row_ind != col_ind:
-                    Cij[col_ind, row_ind] = Cij[row_ind, col_ind]
+        #        rel_ind = abs(col_ind - row_ind)
+        #        Cij[row_ind, col_ind] = auto_corr[rel_ind]
 
-                count += 1
+        #        if row_ind != col_ind:
+        #            Cij[col_ind, row_ind] = Cij[row_ind, col_ind]
 
-                if count % 10000 == 0:
-                    progressbar(count, total_num_entries)
+        #        count += 1
 
-                # print(count/tcounts, "\n")
+        #        print(f"Progress: {count/total_num_entries}%", end='\r')
+
+        # if count % 1000 == 0:
+        #    progressbar(count, total_num_entries)
 
         self._Cij = Cij
 
@@ -413,10 +479,18 @@ class CovarianceCalculator:
             message(excep)
             entire_noise_ts = None
 
-        self._entire_noise_ts = self.demean_ts(entire_noise_ts)
+        entire_noise_ts = self.demean_ts(entire_noise_ts)
+
+        self.entire_noise_ts_time_axis = entire_noise_ts.times
+        self._entire_noise_ts = entire_noise_ts
 
     def demean_ts(self, time_series):
-        return time_series - np.mean(time_series)
+        # if isinstance(time_series, TimeSeries):
+        if self.backend == "numpy" or isinstance(time_series, np.ndarray):
+            return time_series - np.mean(time_series)
+        # elif isinstance(self, da.array):
+        elif self.backend == "dask" and isinstance(time_series, da.array):
+            return time_series - self.mean(time_series).compute()
 
     def find_data_segment(self):
         dir_suffix = int(self.ref_gps_time / 10000000)
@@ -443,8 +517,12 @@ class CovarianceCalculator:
         entire_ts = TimeSeries.read(
             self.data_file_path, f"{self.detector}:{self.channel}"
         )
-        self._entire_noise_ts = self.demean_ts(entire_ts)
-        self.entire_noise_ts_time_axis = np.array(self.entire_noise_ts.times)
+
+        entire_ts = self.demean_ts(entire_ts)
+
+        self.entire_noise_ts_time_axis = self.entire_noise_ts.times
+
+        self._entire_noise_ts = entire_ts
 
         self._entire_segment_gps_start_time = self.entire_noise_ts_time_axis[0]
         self._entire_segment_gps_end_time = self.entire_noise_ts_time_axis[-1]
@@ -464,10 +542,17 @@ class CovarianceCalculator:
         return data_file_name
 
     def save_entire_time_segment(self):
-        self.entire_noise_ts.write(self.data_file_name)
+
+        entire_noise_ts = TimeSeries(
+            data=self.entire_noise_ts, times=self.entire_noise_ts_time_axis
+        )
+        entire_noise_ts.write(self.data_file_name)
 
     def load_entire_time_segment(self):
-        self._entire_noise_ts = TimeSeries.read(self.data_file_name)
+        entire_noise_ts = TimeSeries.read(self.data_file_name)
+
+        self.entire_noise_ts_time_axis = entire_noise_ts.times
+        self._entire_noise_ts = entire_noise_ts
 
     def check_file_exists(self, file_path):
         flag = isfile(file_path)
@@ -490,36 +575,52 @@ class CovarianceCalculator:
     def save_Cij(self):
         """Save the covariance matrix"""
 
-        message("Saving the covariance matrix")
+        message("Saving the covariance matrix", message_verbosity=2)
 
         if isfile(self.Cij_file_name):
             raise FileExistsError(f"{self.Cij_file_name} File already exists!")
 
         else:
-            np.save(self.Cij_file_name, self.Cij)
+            self.save(self.Cij_file_name, self.Cij)
 
     def load_Cij(self):
+        if isinstance(np.ndarray, array):
+            self._Cij = np.load(f"{self.Cij_file_name}.npy")
+        elif isinstance(self, da.array):
 
-        self._Cij = np.load(self.Cij_file_name)
+            f = h5py.File(f"{self.Cij_file_name}.h5")["/Cij"]
+            self._Cij = dask.array.from_array(f)
+            f.close()
+
+    def save_array(self, file_name, array):
+
+        if isinstance(np.ndarray, array):
+            np.save(f"{file_name}.npy", array)
+
+        elif isinstance(self, da.array):
+            return array.to_hdf5(f"{file_name}.h5", "/Cij")
 
     def compute_stat_moments(self, noise_ts):
 
         noise_array = np.array(noise_ts)
 
         # Mean
-        mean = np.mean(noise_array)
+        noise_array_mean = np.mean(noise_array)
 
         # Variance
-        variance = np.mean((noise_array - mean) ** 2)
-        std = np.sqrt(variance)
+        noise_array_variance = np.mean((noise_array - noise_array_mean) ** 2)
+        noise_array_std = self.sqrt(noise_array_variance)
 
-        moments = [mean, variance]
+        moments = [noise_array_mean, noise_array_variance]
         # Higher moments
         for mindex in range(3, 13):
 
             df = self.double_factorial(mindex - 1)
 
-            moments.append(np.mean(((noise_array - mean) / std) ** mindex) / df)
+            moments.append(
+                np.mean(((noise_array - noise_array_mean) / noise_array_std) ** mindex)
+                / df
+            )
 
         return moments
 
